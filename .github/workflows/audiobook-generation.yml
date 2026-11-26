@@ -1,0 +1,166 @@
+name: Audiobook Generation
+
+on:
+  workflow_dispatch: # Manual trigger only
+
+permissions:
+  contents: write    # Grants write permission to publish Releases
+
+env:
+  PART1_TXT: "Audiobooks/The Continental Hoax Audiobook-part 1.txt"
+  PART2_TXT: "Audiobooks/The Continental Hoax Audiobook-part 2.txt"
+  VOICE: af_heart
+  SPEED: "0.85"
+  BITRATE: "128k"
+
+jobs:
+  generate-part-1:
+    runs-on: ubuntu-latest
+    outputs:
+      dur: ${{ steps.encode.outputs.duration_min }}
+      file: ${{ steps.encode.outputs.file_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies & Tools
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install --quiet "kokoro==0.9.4" "numpy<2" scipy soundfile
+          if ! command -v ffmpeg >/dev/null; then 
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
+          fi
+
+      - name: Generate Raw Audio - Part 1
+        run: |
+          mkdir -p dist
+          python3 -c "
+          import os, soundfile as sf
+          from kokoro import KPipeline
+
+          pipeline = KPipeline(lang_code='a')
+          with open(os.environ['PART1_TXT'], 'r', encoding='utf-8') as f:
+              text = f.read()
+
+          generator = pipeline(text, voice=os.environ['VOICE'], speed=1.0)
+          with sf.SoundFile('dist/track1.wav', mode='w', samplerate=24000, channels=1) as outfile:
+              for _, _, audio in generator:
+                  outfile.write(audio)
+          "
+
+      - name: Encode Part 1 to MP3
+        id: encode
+        run: |
+          OUTPUT_NAME="${{ github.event.repository.name }}_Part1.mp3"
+          ffmpeg -y -i dist/track1.wav -af "atempo=${{ env.SPEED }}" -ar 44100 -b:a "${{ env.BITRATE }}" \
+            "dist/${OUTPUT_NAME}" -loglevel warning
+          
+          DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "dist/${OUTPUT_NAME}" | awk '{printf "%.1f",$1/60}')
+          echo "duration_min=$DUR" >> "$GITHUB_OUTPUT"
+          echo "file_name=${OUTPUT_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Part 1 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: part1-mp3
+          path: dist/${{ steps.encode.outputs.file_name }}
+
+  generate-part-2:
+    runs-on: ubuntu-latest
+    outputs:
+      dur: ${{ steps.encode.outputs.duration_min }}
+      file: ${{ steps.encode.outputs.file_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies & Tools
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install --quiet "kokoro==0.9.4" "numpy<2" scipy soundfile
+          if ! command -v ffmpeg >/dev/null; then 
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
+          fi
+
+      - name: Generate Raw Audio - Part 2
+        run: |
+          mkdir -p dist
+          python3 -c "
+          import os, soundfile as sf
+          from kokoro import KPipeline
+
+          pipeline = KPipeline(lang_code='a')
+          with open(os.environ['PART2_TXT'], 'r', encoding='utf-8') as f:
+              text = f.read()
+
+          generator = pipeline(text, voice=os.environ['VOICE'], speed=1.0)
+          with sf.SoundFile('dist/track2.wav', mode='w', samplerate=24000, channels=1) as outfile:
+              for _, _, audio in generator:
+                  outfile.write(audio)
+          "
+
+      - name: Encode Part 2 to MP3
+        id: encode
+        run: |
+          OUTPUT_NAME="${{ github.event.repository.name }}_Part2.mp3"
+          ffmpeg -y -i dist/track2.wav -af "atempo=${{ env.SPEED }}" -ar 44100 -b:a "${{ env.BITRATE }}" \
+            "dist/${OUTPUT_NAME}" -loglevel warning
+          
+          DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "dist/${OUTPUT_NAME}" | awk '{printf "%.1f",$1/60}')
+          echo "duration_min=$DUR" >> "$GITHUB_OUTPUT"
+          echo "file_name=${OUTPUT_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Part 2 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: part2-mp3
+          path: dist/${{ steps.encode.outputs.file_name }}
+
+  publish-release:
+    needs: [generate-part-1, generate-part-2]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Part 1 MP3
+        uses: actions/download-artifact@v4
+        with:
+          name: part1-mp3
+          path: dist
+
+      - name: Download Part 2 MP3
+        uses: actions/download-artifact@v4
+        with:
+          name: part2-mp3
+          path: dist
+
+      - name: Create Date-Based GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DATE_TAG=$(date +'%Y.%m.%d')
+          TAG="audiobook-${DATE_TAG}"
+          
+          COUNTER=1
+          FINAL_TAG="$TAG"
+          while gh release view "$FINAL_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; do
+            FINAL_TAG="${TAG}.${COUNTER}"
+            COUNTER=$((COUNTER+1))
+          done
+          
+          NOTES="Audiobook generated on ${DATE_TAG} using Kokoro TTS.\n\n- **Part 1 Duration:** ${{ needs.generate-part-1.outputs.dur }} mins\n- **Part 2 Duration:** ${{ needs.generate-part-2.outputs.dur }} mins\n- **Voice:** ${{ env.VOICE }}"
+          
+          gh release create "$FINAL_TAG" \
+            "dist/${{ needs.generate-part-1.outputs.file }}" \
+            "dist/${{ needs.generate-part-2.outputs.file }}" \
+            --title "Audiobook — ${DATE_TAG}" \
+            --notes "$NOTES" \
+            --repo "${{ github.repository }}"
